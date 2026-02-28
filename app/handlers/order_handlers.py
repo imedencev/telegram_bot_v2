@@ -35,8 +35,39 @@ async def callback_order_type(callback: CallbackQuery, session: AsyncSession):
     conv_service = ConversationService(session)
     order_service = OrderService(session)
     catalog_service = CatalogService(session)
+    user_service = UserService(session)
+    
     order = await order_service.create_order(callback.from_user.id, order_type)
     context = {"order_id": order.id, "order_type": order_type}
+    
+    # Check consent first
+    has_consent = await user_service.has_consent(callback.from_user.id)
+    if not has_consent:
+        await conv_service.update_state(callback.from_user.id, OrderState.SHOW_PRIVACY_POLICY, context, order.id)
+        policy_text = UserService.get_privacy_policy_text()
+        keyboard = build_consent_keyboard()
+        await callback.message.answer(policy_text, reply_markup=keyboard)
+        return
+    
+    # Check name second
+    has_name = await user_service.has_name(callback.from_user.id)
+    if not has_name:
+        await conv_service.update_state(callback.from_user.id, OrderState.ASK_NAME, context, order.id)
+        await callback.message.answer("Как вас зовут?")
+        return
+    
+    # Check phone third
+    from sqlalchemy import select
+    from app.models.database import User
+    result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+    user = result.scalar_one_or_none()
+    
+    if not user or not user.phone:
+        await conv_service.update_state(callback.from_user.id, OrderState.ASK_PHONE, context, order.id)
+        await callback.message.answer("Ваш номер телефона для связи?")
+        return
+    
+    # If has all three (consent, name, phone), show catalog
     await conv_service.update_state(callback.from_user.id, OrderState.SHOW_CATALOG, context, order.id)
     items = await catalog_service.get_items_by_type(order_type)
     if not items:
@@ -149,14 +180,13 @@ async def callback_location(callback: CallbackQuery, session: AsyncSession):
     await callback.message.answer("Когда нужен заказ?\nНапишите дату и время (например: завтра в 15:00 или 01.03 в 18:00)")
 
 @router.callback_query(F.data.startswith("consent:"))
-async def callback_consent(callback: CallbackQuery, session: AsyncSession, bot):
+async def callback_consent(callback: CallbackQuery, session: AsyncSession):
     await callback.answer()
     consent = callback.data.split(":")[1] == "yes"
     conv_service = ConversationService(session)
     user_service = UserService(session)
-    order_service = OrderService(session)
+    catalog_service = CatalogService(session)
     context = await conv_service.get_context(callback.from_user.id)
-    order_id = context.get("order_id")
     
     if consent:
         await user_service.give_consent(callback.from_user.id)
@@ -174,19 +204,25 @@ async def callback_consent(callback: CallbackQuery, session: AsyncSession, bot):
         result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
         user = result.scalar_one_or_none()
         
-        if user and user.phone:
-            await order_service.update_order(order_id, customer_phone=user.phone)
-            order = await order_service.complete_order(order_id)
-            notification_service = NotificationService(bot)
-            await notification_service.notify_new_order(order)
-            await conv_service.clear_state(callback.from_user.id)
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="📅 Добавить в календарь", callback_data=f"export_calendar:{order.id}")
-            ]])
-            await callback.message.answer(ResponseVariations.get_order_completed(), reply_markup=keyboard)
-        else:
+        if not user or not user.phone:
             await conv_service.update_state(callback.from_user.id, OrderState.ASK_PHONE, context)
             await callback.message.answer("Ваш номер телефона для связи?")
+            return
+        
+        # If has name and phone, show catalog
+        order_type = context.get("order_type")
+        await conv_service.update_state(callback.from_user.id, OrderState.SHOW_CATALOG, context)
+        items = await catalog_service.get_items_by_type(order_type)
+        if not items:
+            await callback.message.answer("К сожалению, сейчас нет доступных позиций.")
+            return
+        keyboard_buttons = []
+        for item in items[:10]:
+            price_text = f" - {int(item.price)}₽" if item.price else ""
+            keyboard_buttons.append([InlineKeyboardButton(text=f"{item.title}{price_text}", callback_data=f"catalog:{item.id}")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        type_name = "торты" if order_type == "cake" else "десерты"
+        await callback.message.answer(f"Выберите {type_name}:", reply_markup=keyboard)
     else:
         await conv_service.clear_state(callback.from_user.id)
         await callback.message.answer("Без согласия на обработку персональных данных мы не можем принять заказ.\nЕсли передумаете, начните заново с /start")
@@ -196,6 +232,7 @@ async def handle_text_message(message: Message, session: AsyncSession, bot):
     conv_service = ConversationService(session)
     order_service = OrderService(session)
     user_service = UserService(session)
+    catalog_service = CatalogService(session)
     state = await conv_service.get_or_create_state(message.from_user.id)
     current_state = OrderState(state.current_state)
     context = await conv_service.get_context(message.from_user.id)
@@ -238,7 +275,62 @@ async def handle_text_message(message: Message, session: AsyncSession, bot):
             await message.answer(f"Отлично! {ResponseVariations.get_confirmation()}")
             return
     
-    if current_state == OrderState.ASK_WEIGHT:
+    if current_state == OrderState.ASK_NAME:
+        full_name = message.text.strip()
+        if len(full_name) < 2:
+            await message.answer("Пожалуйста, введите ваше имя")
+            return
+        
+        await user_service.update_name(message.from_user.id, full_name)
+        
+        # Check if user has phone
+        from sqlalchemy import select
+        from app.models.database import User
+        result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if not user or not user.phone:
+            await conv_service.update_state(message.from_user.id, OrderState.ASK_PHONE, context)
+            await message.answer("Ваш номер телефона для связи?")
+            return
+        
+        # If has phone, show catalog
+        order_type = context.get("order_type")
+        await conv_service.update_state(message.from_user.id, OrderState.SHOW_CATALOG, context)
+        items = await catalog_service.get_items_by_type(order_type)
+        if not items:
+            await message.answer("К сожалению, сейчас нет доступных позиций.")
+            return
+        keyboard_buttons = []
+        for item in items[:10]:
+            price_text = f" - {int(item.price)}₽" if item.price else ""
+            keyboard_buttons.append([InlineKeyboardButton(text=f"{item.title}{price_text}", callback_data=f"catalog:{item.id}")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        type_name = "торты" if order_type == "cake" else "десерты"
+        await message.answer(f"Спасибо, {full_name}! Выберите {type_name}:", reply_markup=keyboard)
+    elif current_state == OrderState.ASK_PHONE:
+        phone = message.text.strip()
+        if not validate_phone(phone):
+            await message.answer("Пожалуйста, введите корректный номер телефона\n(например: 89123456789 или +79123456789)")
+            return
+        
+        await user_service.update_phone(message.from_user.id, phone)
+        
+        # Show catalog after phone is saved
+        order_type = context.get("order_type")
+        await conv_service.update_state(message.from_user.id, OrderState.SHOW_CATALOG, context)
+        items = await catalog_service.get_items_by_type(order_type)
+        if not items:
+            await message.answer("К сожалению, сейчас нет доступных позиций.")
+            return
+        keyboard_buttons = []
+        for item in items[:10]:
+            price_text = f" - {int(item.price)}₽" if item.price else ""
+            keyboard_buttons.append([InlineKeyboardButton(text=f"{item.title}{price_text}", callback_data=f"catalog:{item.id}")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        type_name = "торты" if order_type == "cake" else "десерты"
+        await message.answer(f"Отлично! Выберите {type_name}:", reply_markup=keyboard)
+    elif current_state == OrderState.ASK_WEIGHT:
         try:
             weight = float(message.text.replace(",", "."))
             if weight < 2 or weight > 20:
@@ -278,23 +370,7 @@ async def handle_text_message(message: Message, session: AsyncSession, bot):
         await order_service.update_order(order_id, issue_time=message.text)
         context["issue_time"] = message.text
         
-        # Check consent first
-        has_consent = await user_service.has_consent(message.from_user.id)
-        if not has_consent:
-            await conv_service.update_state(message.from_user.id, OrderState.SHOW_PRIVACY_POLICY, context)
-            policy_text = UserService.get_privacy_policy_text()
-            keyboard = build_consent_keyboard()
-            await message.answer(policy_text, reply_markup=keyboard)
-            return
-        
-        # Check name second
-        has_name = await user_service.has_name(message.from_user.id)
-        if not has_name:
-            await conv_service.update_state(message.from_user.id, OrderState.ASK_NAME, context)
-            await message.answer("Как вас зовут?")
-            return
-        
-        # Check phone third
+        # Get phone from user record (it should always exist at this point)
         from sqlalchemy import select
         from app.models.database import User
         result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
@@ -311,53 +387,9 @@ async def handle_text_message(message: Message, session: AsyncSession, bot):
             ]])
             await message.answer(ResponseVariations.get_order_completed(), reply_markup=keyboard)
         else:
-            await conv_service.update_state(message.from_user.id, OrderState.ASK_PHONE, context)
-            await message.answer("Ваш номер телефона для связи?")
-    elif current_state == OrderState.ASK_NAME:
-        full_name = message.text.strip()
-        if len(full_name) < 2:
-            await message.answer("Пожалуйста, введите ваше имя")
-            return
-        
-        await user_service.update_name(message.from_user.id, full_name)
-        
-        # Check phone
-        from sqlalchemy import select
-        from app.models.database import User
-        result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
-        user = result.scalar_one_or_none()
-        
-        if user and user.phone:
-            await order_service.update_order(order_id, customer_phone=user.phone)
-            order = await order_service.complete_order(order_id)
-            notification_service = NotificationService(bot)
-            await notification_service.notify_new_order(order)
+            # This shouldn't happen, but handle it gracefully
+            await message.answer("Произошла ошибка. Пожалуйста, начните заново с /start")
             await conv_service.clear_state(message.from_user.id)
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="📅 Добавить в календарь", callback_data=f"export_calendar:{order.id}")
-            ]])
-            await message.answer(ResponseVariations.get_order_completed(), reply_markup=keyboard)
-        else:
-            await conv_service.update_state(message.from_user.id, OrderState.ASK_PHONE, context)
-            await message.answer("Ваш номер телефона для связи?")
-    elif current_state == OrderState.ASK_PHONE:
-        phone = message.text.strip()
-        if not validate_phone(phone):
-            await message.answer("Пожалуйста, введите корректный номер телефона\n(например: 89123456789 или +79123456789)")
-            return
-        
-        await order_service.update_order(order_id, customer_phone=phone)
-        await user_service.update_phone(message.from_user.id, phone)
-        
-        order = await order_service.complete_order(order_id)
-        notification_service = NotificationService(bot)
-        await notification_service.notify_new_order(order)
-        await conv_service.clear_state(message.from_user.id)
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📅 Добавить в календарь", callback_data=f"export_calendar:{order.id}")
-        ]])
-        await message.answer(ResponseVariations.get_order_completed(), reply_markup=keyboard)
 
 def build_decor_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎨 Крем", callback_data="decor:cream")],[InlineKeyboardButton(text="🍫 Шоколад", callback_data="decor:chocolate")],[InlineKeyboardButton(text="🍓 Ягоды", callback_data="decor:berries")],[InlineKeyboardButton(text="🌸 Мастика", callback_data="decor:fondant")]])
