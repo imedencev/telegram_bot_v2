@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 from app.database import init_db, get_session
 from app.handlers import order_handlers, business_messages
+from app.services.schedule_service import ScheduleService
 
 load_dotenv()
 
@@ -31,6 +32,13 @@ async def main():
     await init_db()
     logger.info("Database initialized")
     
+    # Sync staff data from pythonbotk13 database
+    try:
+        staff_count = ScheduleService.sync_staff_from_database()
+        logger.info(f"Synced {staff_count} staff members from pythonbotk13 database")
+    except Exception as e:
+        logger.warning(f"Could not sync staff data: {e}")
+    
     bot = Bot(
         token=bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -46,7 +54,13 @@ async def main():
         async for session in get_session():
             data["session"] = session
             data["bot"] = bot
-            return await handler(event, data)
+            try:
+                result = await handler(event, data)
+                await session.commit()
+                return result
+            except Exception as e:
+                await session.rollback()
+                raise
     
     dp.message.middleware()(db_session_middleware)
     dp.callback_query.middleware()(db_session_middleware)

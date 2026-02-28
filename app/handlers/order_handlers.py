@@ -67,6 +67,8 @@ async def callback_catalog_item(callback: CallbackQuery, session: AsyncSession):
     await order_service.update_order(order_id, cake_flavor=item.title)
     context["cake_flavor"] = item.title
     context["item_id"] = item.id
+    context["last_shown_cake"] = {"id": item.id, "title": item.title, "type": item.type}
+    
     if item.image_link:
         try:
             await callback.message.answer_photo(photo=item.image_link, caption=f"Вы выбрали: {item.title}")
@@ -155,13 +157,36 @@ async def callback_consent(callback: CallbackQuery, session: AsyncSession, bot):
     order_service = OrderService(session)
     context = await conv_service.get_context(callback.from_user.id)
     order_id = context.get("order_id")
+    
     if consent:
         await user_service.give_consent(callback.from_user.id)
-        order = await order_service.complete_order(order_id)
-        notification_service = NotificationService(bot)
-        await notification_service.notify_new_order(order)
-        await conv_service.clear_state(callback.from_user.id)
-        await callback.message.answer(ResponseVariations.get_order_completed())
+        
+        # Check if user has name
+        has_name = await user_service.has_name(callback.from_user.id)
+        if not has_name:
+            await conv_service.update_state(callback.from_user.id, OrderState.ASK_NAME, context)
+            await callback.message.answer("Как вас зовут?")
+            return
+        
+        # Check if user has phone
+        from sqlalchemy import select
+        from app.models.database import User
+        result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if user and user.phone:
+            await order_service.update_order(order_id, customer_phone=user.phone)
+            order = await order_service.complete_order(order_id)
+            notification_service = NotificationService(bot)
+            await notification_service.notify_new_order(order)
+            await conv_service.clear_state(callback.from_user.id)
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📅 Добавить в календарь", callback_data=f"export_calendar:{order.id}")
+            ]])
+            await callback.message.answer(ResponseVariations.get_order_completed(), reply_markup=keyboard)
+        else:
+            await conv_service.update_state(callback.from_user.id, OrderState.ASK_PHONE, context)
+            await callback.message.answer("Ваш номер телефона для связи?")
     else:
         await conv_service.clear_state(callback.from_user.id)
         await callback.message.answer("Без согласия на обработку персональных данных мы не можем принять заказ.\nЕсли передумаете, начните заново с /start")
@@ -176,6 +201,43 @@ async def handle_text_message(message: Message, session: AsyncSession, bot):
     context = await conv_service.get_context(message.from_user.id)
     order_id = context.get("order_id")
     order_type = context.get("order_type")
+    
+    # Detect greetings and order keywords only when user is not in active order flow
+    if not order_id:
+        text_lower = message.text.lower().strip()
+        greeting_words = ['привет', 'здравствуйте', 'здравствуй', 'здорово', 'приветствую', 'hi', 'hello', 'hey']
+        
+        if any(text_lower.startswith(word) or text_lower == word for word in greeting_words):
+            await conv_service.clear_state(message.from_user.id)
+            greeting = ResponseVariations.get_greeting() + " Что хотите заказать?"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🎂 Торт", callback_data="order_type:cake"),
+                InlineKeyboardButton(text="🧁 Десерт", callback_data="order_type:dessert")
+            ]])
+            await message.answer(greeting, reply_markup=keyboard)
+            return
+        
+        # Detect order keywords
+        order_keywords = ['торт', 'тортик', 'десерт', 'заказ', 'заказать', 'хочу заказать', 'мой заказ']
+        if any(keyword in text_lower for keyword in order_keywords):
+            await conv_service.clear_state(message.from_user.id)
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🎂 Торт", callback_data="order_type:cake"),
+                InlineKeyboardButton(text="🧁 Десерт", callback_data="order_type:dessert")
+            ]])
+            await message.answer("Что хотите заказать?", reply_markup=keyboard)
+            return
+    
+    # Detect "I want it" phrases
+    text_lower = message.text.lower().strip()
+    want_it_phrases = ['хочу его', 'хочу её', 'хочу этот', 'хочу эту', 'беру его', 'беру её', 'возьму его', 'возьму её']
+    
+    if any(phrase in text_lower for phrase in want_it_phrases):
+        last_shown_cake = context.get("last_shown_cake")
+        if last_shown_cake and order_id:
+            await message.answer(f"Отлично! {ResponseVariations.get_confirmation()}")
+            return
+    
     if current_state == OrderState.ASK_WEIGHT:
         try:
             weight = float(message.text.replace(",", "."))
@@ -215,27 +277,87 @@ async def handle_text_message(message: Message, session: AsyncSession, bot):
             return
         await order_service.update_order(order_id, issue_time=message.text)
         context["issue_time"] = message.text
-        await conv_service.update_state(message.from_user.id, OrderState.ASK_PHONE, context)
-        await message.answer("Ваш номер телефона для связи?")
+        
+        # Check consent first
+        has_consent = await user_service.has_consent(message.from_user.id)
+        if not has_consent:
+            await conv_service.update_state(message.from_user.id, OrderState.SHOW_PRIVACY_POLICY, context)
+            policy_text = UserService.get_privacy_policy_text()
+            keyboard = build_consent_keyboard()
+            await message.answer(policy_text, reply_markup=keyboard)
+            return
+        
+        # Check name second
+        has_name = await user_service.has_name(message.from_user.id)
+        if not has_name:
+            await conv_service.update_state(message.from_user.id, OrderState.ASK_NAME, context)
+            await message.answer("Как вас зовут?")
+            return
+        
+        # Check phone third
+        from sqlalchemy import select
+        from app.models.database import User
+        result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if user and user.phone:
+            await order_service.update_order(order_id, customer_phone=user.phone)
+            order = await order_service.complete_order(order_id)
+            notification_service = NotificationService(bot)
+            await notification_service.notify_new_order(order)
+            await conv_service.clear_state(message.from_user.id)
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📅 Добавить в календарь", callback_data=f"export_calendar:{order.id}")
+            ]])
+            await message.answer(ResponseVariations.get_order_completed(), reply_markup=keyboard)
+        else:
+            await conv_service.update_state(message.from_user.id, OrderState.ASK_PHONE, context)
+            await message.answer("Ваш номер телефона для связи?")
+    elif current_state == OrderState.ASK_NAME:
+        full_name = message.text.strip()
+        if len(full_name) < 2:
+            await message.answer("Пожалуйста, введите ваше имя")
+            return
+        
+        await user_service.update_name(message.from_user.id, full_name)
+        
+        # Check phone
+        from sqlalchemy import select
+        from app.models.database import User
+        result = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if user and user.phone:
+            await order_service.update_order(order_id, customer_phone=user.phone)
+            order = await order_service.complete_order(order_id)
+            notification_service = NotificationService(bot)
+            await notification_service.notify_new_order(order)
+            await conv_service.clear_state(message.from_user.id)
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📅 Добавить в календарь", callback_data=f"export_calendar:{order.id}")
+            ]])
+            await message.answer(ResponseVariations.get_order_completed(), reply_markup=keyboard)
+        else:
+            await conv_service.update_state(message.from_user.id, OrderState.ASK_PHONE, context)
+            await message.answer("Ваш номер телефона для связи?")
     elif current_state == OrderState.ASK_PHONE:
         phone = message.text.strip()
         if not validate_phone(phone):
             await message.answer("Пожалуйста, введите корректный номер телефона\n(например: 89123456789 или +79123456789)")
             return
+        
         await order_service.update_order(order_id, customer_phone=phone)
-        context["customer_phone"] = phone
-        has_consent = await user_service.has_consent(message.from_user.id)
-        if has_consent:
-            order = await order_service.complete_order(order_id)
-            notification_service = NotificationService(bot)
-            await notification_service.notify_new_order(order)
-            await conv_service.clear_state(message.from_user.id)
-            await message.answer(ResponseVariations.get_order_completed())
-        else:
-            await conv_service.update_state(message.from_user.id, OrderState.SHOW_PRIVACY_POLICY, context)
-            policy_text = UserService.get_privacy_policy_text()
-            keyboard = build_consent_keyboard()
-            await message.answer(policy_text, reply_markup=keyboard)
+        await user_service.update_phone(message.from_user.id, phone)
+        
+        order = await order_service.complete_order(order_id)
+        notification_service = NotificationService(bot)
+        await notification_service.notify_new_order(order)
+        await conv_service.clear_state(message.from_user.id)
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📅 Добавить в календарь", callback_data=f"export_calendar:{order.id}")
+        ]])
+        await message.answer(ResponseVariations.get_order_completed(), reply_markup=keyboard)
 
 def build_decor_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎨 Крем", callback_data="decor:cream")],[InlineKeyboardButton(text="🍫 Шоколад", callback_data="decor:chocolate")],[InlineKeyboardButton(text="🍓 Ягоды", callback_data="decor:berries")],[InlineKeyboardButton(text="🌸 Мастика", callback_data="decor:fondant")]])

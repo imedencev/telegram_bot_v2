@@ -63,3 +63,38 @@ class UserService:
             "Продолжая, вы соглашаетесь на обработку персональных данных "
             "в соответствии с 152-ФЗ."
         )
+    
+    async def has_name(self, telegram_id: int) -> bool:
+        """Check if user has provided their name"""
+        user = await self.get_or_create_user(telegram_id)
+        return user.full_name is not None and len(user.full_name.strip()) > 0
+    
+    async def update_name(self, telegram_id: int, full_name: str):
+        """Update user's name"""
+        result = await self.session.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            user = User(telegram_id=telegram_id, full_name=full_name.strip())
+            self.session.add(user)
+        else:
+            user.full_name = full_name.strip()
+        
+        await self.session.flush()
+    
+    async def update_phone(self, telegram_id: int, phone: str):
+        """Update user's phone number"""
+        result = await self.session.execute(
+            select(User).where(User.telegram_id == telegram_id)
+        )
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            user = User(telegram_id=telegram_id, phone=phone)
+            self.session.add(user)
+        else:
+            user.phone = phone
+        
+        await self.session.flush()

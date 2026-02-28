@@ -4,12 +4,14 @@ Business messages handler - owner commands and support.
 import os
 import sqlite3
 from datetime import datetime, timedelta
+from io import BytesIO
 from aiogram import Router, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 from app.models.database import Order, User, ConversationState
+from app.services.calendar_export import generate_ics_content, get_ics_filename
 
 router = Router()
 
@@ -212,3 +214,97 @@ async def cmd_support(message: Message):
 Мы работаем с 08:00 до 20:00
 """
     await message.answer(support_text)
+
+
+@router.message(Command("my_orders"))
+async def cmd_my_orders(message: Message, session: AsyncSession):
+    """Show user's order history"""
+    result = await session.execute(
+        select(Order)
+        .where(and_(
+            Order.customer_telegram_id == message.from_user.id,
+            Order.status != "draft"
+        ))
+        .order_by(Order.created_at.desc())
+        .limit(10)
+    )
+    orders = list(result.scalars().all())
+    
+    if not orders:
+        await message.answer("📋 У вас пока нет завершённых заказов.\n\nНачните новый заказ: /start")
+        return
+    
+    orders_text = f"📋 <b>Ваши заказы</b> (последние {len(orders)}):\n\n"
+    
+    for i, order in enumerate(orders, 1):
+        status_emoji = "✅" if order.status == "completed" else "⏳"
+        order_type_emoji = "🎂" if order.order_type == "cake" else "🧁"
+        
+        orders_text += f"{status_emoji} <b>Заказ #{order.id}</b>\n"
+        orders_text += f"{order_type_emoji} {order.cake_flavor or 'Не указано'}\n"
+        
+        if order.order_type == "cake" and order.weight_kg:
+            orders_text += f"⚖️ Вес: {order.weight_kg} кг\n"
+        elif order.order_type == "dessert" and order.quantity:
+            orders_text += f"🔢 Количество: {order.quantity} шт\n"
+        
+        if order.pickup_location:
+            orders_text += f"📍 {order.pickup_location}\n"
+        
+        if order.issue_time:
+            orders_text += f"🕐 {order.issue_time}\n"
+        
+        if order.created_at:
+            orders_text += f"📅 Заказ от: {order.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+        
+        orders_text += "\n"
+    
+    # Add calendar export buttons for orders
+    keyboard_buttons = []
+    for order in orders[:5]:  # Show buttons for first 5 orders
+        keyboard_buttons.append([InlineKeyboardButton(
+            text=f"📅 Календарь для заказа #{order.id}",
+            callback_data=f"export_calendar:{order.id}"
+        )])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons) if keyboard_buttons else None
+    
+    orders_text += "Новый заказ: /start"
+    
+    await message.answer(orders_text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("export_calendar:"))
+async def callback_export_calendar(callback: CallbackQuery, session: AsyncSession):
+    """Export order to calendar (ICS file)"""
+    await callback.answer()
+    
+    try:
+        order_id = int(callback.data.split(":")[1])
+        
+        # Get order from database
+        result = await session.execute(
+            select(Order).where(and_(
+                Order.id == order_id,
+                Order.customer_telegram_id == callback.from_user.id
+            ))
+        )
+        order = result.scalar_one_or_none()
+        
+        if not order:
+            await callback.message.answer("❌ Заказ не найден")
+            return
+        
+        # Generate ICS file
+        ics_content = generate_ics_content(order)
+        ics_bytes = ics_content.encode('utf-8')
+        ics_file = BufferedInputFile(ics_bytes, filename=get_ics_filename(order))
+        
+        # Send ICS file
+        await callback.message.answer_document(
+            ics_file,
+            caption=f"📅 Календарь для заказа #{order.id}\n\nОткройте файл, чтобы добавить событие в ваш календарь."
+        )
+        
+    except Exception as e:
+        await callback.message.answer(f"❌ Ошибка экспорта: {str(e)}")

@@ -4,6 +4,8 @@ Notification Service - notifies staff about new orders.
 import os
 from aiogram import Bot
 from app.models.database import Order
+from app.services.calendar_export import generate_ics_content, get_ics_filename
+from aiogram.types import BufferedInputFile
 
 
 class NotificationService:
@@ -15,9 +17,16 @@ class NotificationService:
         """Send notification to staff about new order"""
         message = self._format_order_message(order)
         
+        # Generate calendar file
+        ics_content = generate_ics_content(order)
+        ics_bytes = ics_content.encode('utf-8')
+        ics_file = BufferedInputFile(ics_bytes, filename=get_ics_filename(order))
+        
         for staff_id in self.staff_ids:
             try:
                 await self.bot.send_message(staff_id, message, parse_mode="HTML")
+                # Send calendar file to staff
+                await self.bot.send_document(staff_id, ics_file)
             except Exception as e:
                 print(f"Failed to notify staff {staff_id}: {e}")
     

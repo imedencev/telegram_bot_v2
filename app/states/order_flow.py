@@ -18,6 +18,7 @@ class OrderState(Enum):
     ASK_PICKUP_LOCATION = "ask_pickup_location"
     ASK_ISSUE_TIME = "ask_issue_time"
     ASK_PHONE = "ask_phone"
+    ASK_NAME = "ask_name"
     CHECK_CONSENT = "check_consent"
     SHOW_PRIVACY_POLICY = "show_privacy_policy"
     CONFIRM_ORDER = "confirm_order"
