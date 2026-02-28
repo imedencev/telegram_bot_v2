@@ -1,0 +1,258 @@
+"""Order handlers - complete version"""
+import re
+from aiogram import Router, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.services.order_service import OrderService
+from app.services.conversation_service import ConversationService
+from app.services.notification_service import NotificationService
+from app.services.catalog_service import CatalogService
+from app.services.user_service import UserService
+from app.services.response_variations import ResponseVariations
+from app.states.order_flow import OrderState
+
+router = Router()
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, session: AsyncSession):
+    conv_service = ConversationService(session)
+    await conv_service.clear_state(message.from_user.id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎂 Торт", callback_data="order_type:cake"),InlineKeyboardButton(text="🧁 Десерт", callback_data="order_type:dessert")]])
+    greeting = ResponseVariations.get_greeting() + " Что хотите заказать?"
+    await message.answer(greeting, reply_markup=keyboard)
+
+@router.message(Command("revoke_consent"))
+async def cmd_revoke_consent(message: Message, session: AsyncSession):
+    user_service = UserService(session)
+    await user_service.revoke_consent(message.from_user.id)
+    await message.answer("Ваше согласие на обработку персональных данных отозвано.\nДля оформления новых заказов потребуется дать согласие снова.")
+
+@router.callback_query(F.data.startswith("order_type:"))
+async def callback_order_type(callback: CallbackQuery, session: AsyncSession):
+    await callback.answer()
+    order_type = callback.data.split(":")[1]
+    conv_service = ConversationService(session)
+    order_service = OrderService(session)
+    catalog_service = CatalogService(session)
+    order = await order_service.create_order(callback.from_user.id, order_type)
+    context = {"order_id": order.id, "order_type": order_type}
+    await conv_service.update_state(callback.from_user.id, OrderState.SHOW_CATALOG, context, order.id)
+    items = await catalog_service.get_items_by_type(order_type)
+    if not items:
+        await callback.message.answer("К сожалению, сейчас нет доступных позиций.")
+        return
+    keyboard_buttons = []
+    for item in items[:10]:
+        price_text = f" - {int(item.price)}₽" if item.price else ""
+        keyboard_buttons.append([InlineKeyboardButton(text=f"{item.title}{price_text}", callback_data=f"catalog:{item.id}")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    type_name = "торты" if order_type == "cake" else "десерты"
+    await callback.message.answer(f"Выберите {type_name}:", reply_markup=keyboard)
+
+@router.callback_query(F.data.startswith("catalog:"))
+async def callback_catalog_item(callback: CallbackQuery, session: AsyncSession):
+    await callback.answer()
+    item_id = int(callback.data.split(":")[1])
+    conv_service = ConversationService(session)
+    order_service = OrderService(session)
+    catalog_service = CatalogService(session)
+    item = await catalog_service.get_item_by_id(item_id)
+    if not item:
+        await callback.message.answer("Позиция не найдена.")
+        return
+    context = await conv_service.get_context(callback.from_user.id)
+    order_id = context.get("order_id")
+    order_type = context.get("order_type")
+    await order_service.update_order(order_id, cake_flavor=item.title)
+    context["cake_flavor"] = item.title
+    context["item_id"] = item.id
+    if item.image_link:
+        try:
+            await callback.message.answer_photo(photo=item.image_link, caption=f"Вы выбрали: {item.title}")
+        except:
+            await callback.message.answer(f"Вы выбрали: {item.title}")
+    else:
+        await callback.message.answer(f"Вы выбрали: {item.title}")
+    if order_type == "cake":
+        if "1.5кг к празднику" in item.title:
+            await order_service.update_order(order_id, weight_kg=1.5)
+            context["weight_kg"] = 1.5
+            await conv_service.update_state(callback.from_user.id, OrderState.ASK_DECOR_TYPE, context)
+            keyboard = build_decor_keyboard()
+            await callback.message.answer("Выберите оформление торта:", reply_markup=keyboard)
+        elif "Бенто торт" in item.title:
+            await order_service.update_order(order_id, weight_kg=0.3)
+            context["weight_kg"] = 0.3
+            await conv_service.update_state(callback.from_user.id, OrderState.ASK_DECOR_TYPE, context)
+            keyboard = build_decor_keyboard()
+            await callback.message.answer("Выберите оформление торта:", reply_markup=keyboard)
+        else:
+            await conv_service.update_state(callback.from_user.id, OrderState.ASK_WEIGHT, context)
+            await callback.message.answer("Какой вес торта? (минимум 2 кг, например: 2 или 2.5)")
+    else:
+        await conv_service.update_state(callback.from_user.id, OrderState.ASK_QUANTITY, context)
+        await callback.message.answer("Сколько десертов? (например: 6)")
+
+@router.callback_query(F.data.startswith("decor:"))
+async def callback_decor_type(callback: CallbackQuery, session: AsyncSession):
+    await callback.answer()
+    decor_type = callback.data.split(":")[1]
+    conv_service = ConversationService(session)
+    order_service = OrderService(session)
+    context = await conv_service.get_context(callback.from_user.id)
+    order_id = context.get("order_id")
+    await order_service.update_order(order_id, decor_type=decor_type)
+    context["decor_type"] = decor_type
+    await conv_service.update_state(callback.from_user.id, OrderState.ASK_INSCRIPTION, context)
+    await callback.message.answer("Какую надпись сделать на торте?\n(Напишите текст или отправьте '-' если надпись не нужна)")
+
+@router.callback_query(F.data.startswith("addon:"))
+async def callback_addon_toggle(callback: CallbackQuery, session: AsyncSession):
+    await callback.answer()
+    addon_type = callback.data.split(":")[1]
+    conv_service = ConversationService(session)
+    order_service = OrderService(session)
+    context = await conv_service.get_context(callback.from_user.id)
+    order_id = context.get("order_id")
+    addon_key = f"addon_{addon_type}"
+    current_value = context.get(addon_key, False)
+    new_value = not current_value
+    context[addon_key] = new_value
+    await order_service.update_order(order_id, **{addon_key: new_value})
+    await conv_service.update_state(callback.from_user.id, OrderState.ASK_ADDONS, context)
+    keyboard = build_addons_keyboard(context)
+    await callback.message.edit_reply_markup(reply_markup=keyboard)
+
+@router.callback_query(F.data == "addons_done")
+async def callback_addons_done(callback: CallbackQuery, session: AsyncSession):
+    await callback.answer()
+    conv_service = ConversationService(session)
+    context = await conv_service.get_context(callback.from_user.id)
+    await conv_service.update_state(callback.from_user.id, OrderState.ASK_PICKUP_LOCATION, context)
+    keyboard = build_location_keyboard()
+    await callback.message.answer("Где будете забирать заказ?", reply_markup=keyboard)
+
+@router.callback_query(F.data.startswith("location:"))
+async def callback_location(callback: CallbackQuery, session: AsyncSession):
+    await callback.answer()
+    location = callback.data.split(":")[1]
+    conv_service = ConversationService(session)
+    order_service = OrderService(session)
+    context = await conv_service.get_context(callback.from_user.id)
+    order_id = context.get("order_id")
+    await order_service.update_order(order_id, pickup_location=location)
+    context["pickup_location"] = location
+    await conv_service.update_state(callback.from_user.id, OrderState.ASK_ISSUE_TIME, context)
+    await callback.message.answer("Когда нужен заказ?\nНапишите дату и время (например: завтра в 15:00 или 01.03 в 18:00)")
+
+@router.callback_query(F.data.startswith("consent:"))
+async def callback_consent(callback: CallbackQuery, session: AsyncSession, bot):
+    await callback.answer()
+    consent = callback.data.split(":")[1] == "yes"
+    conv_service = ConversationService(session)
+    user_service = UserService(session)
+    order_service = OrderService(session)
+    context = await conv_service.get_context(callback.from_user.id)
+    order_id = context.get("order_id")
+    if consent:
+        await user_service.give_consent(callback.from_user.id)
+        order = await order_service.complete_order(order_id)
+        notification_service = NotificationService(bot)
+        await notification_service.notify_new_order(order)
+        await conv_service.clear_state(callback.from_user.id)
+        await callback.message.answer(ResponseVariations.get_order_completed())
+    else:
+        await conv_service.clear_state(callback.from_user.id)
+        await callback.message.answer("Без согласия на обработку персональных данных мы не можем принять заказ.\nЕсли передумаете, начните заново с /start")
+
+@router.message(F.text)
+async def handle_text_message(message: Message, session: AsyncSession, bot):
+    conv_service = ConversationService(session)
+    order_service = OrderService(session)
+    user_service = UserService(session)
+    state = await conv_service.get_or_create_state(message.from_user.id)
+    current_state = OrderState(state.current_state)
+    context = await conv_service.get_context(message.from_user.id)
+    order_id = context.get("order_id")
+    order_type = context.get("order_type")
+    if current_state == OrderState.ASK_WEIGHT:
+        try:
+            weight = float(message.text.replace(",", "."))
+            if weight < 2 or weight > 20:
+                await message.answer("Пожалуйста, укажите вес от 2 до 20 кг")
+                return
+            await order_service.update_order(order_id, weight_kg=weight)
+            context["weight_kg"] = weight
+            await conv_service.update_state(message.from_user.id, OrderState.ASK_DECOR_TYPE, context)
+            keyboard = build_decor_keyboard()
+            await message.answer("Выберите оформление торта:", reply_markup=keyboard)
+        except ValueError:
+            await message.answer("Пожалуйста, введите число (например: 1.5 или 2)")
+    elif current_state == OrderState.ASK_QUANTITY:
+        try:
+            quantity = int(message.text)
+            if quantity <= 0 or quantity > 100:
+                await message.answer("Пожалуйста, укажите количество от 1 до 100")
+                return
+            await order_service.update_order(order_id, quantity=quantity)
+            context["quantity"] = quantity
+            await conv_service.update_state(message.from_user.id, OrderState.ASK_PICKUP_LOCATION, context)
+            keyboard = build_location_keyboard()
+            await message.answer("Где будете забирать заказ?", reply_markup=keyboard)
+        except ValueError:
+            await message.answer("Пожалуйста, введите целое число (например: 6)")
+    elif current_state == OrderState.ASK_INSCRIPTION:
+        inscription = message.text if message.text != "-" else ""
+        await order_service.update_order(order_id, inscription=inscription)
+        context["inscription"] = inscription
+        await conv_service.update_state(message.from_user.id, OrderState.ASK_ADDONS, context)
+        keyboard = build_addons_keyboard(context)
+        await message.answer("Выберите дополнения к торту:\n\n🎭 Топпер - 200₽\n🎆 Свеча-фейерверк - 150₽\n📸 Фотопечать - бесплатно", reply_markup=keyboard)
+    elif current_state == OrderState.ASK_ISSUE_TIME:
+        if len(message.text.strip()) < 3:
+            await message.answer("Пожалуйста, укажите дату и время")
+            return
+        await order_service.update_order(order_id, issue_time=message.text)
+        context["issue_time"] = message.text
+        await conv_service.update_state(message.from_user.id, OrderState.ASK_PHONE, context)
+        await message.answer("Ваш номер телефона для связи?")
+    elif current_state == OrderState.ASK_PHONE:
+        phone = message.text.strip()
+        if not validate_phone(phone):
+            await message.answer("Пожалуйста, введите корректный номер телефона\n(например: 89123456789 или +79123456789)")
+            return
+        await order_service.update_order(order_id, customer_phone=phone)
+        context["customer_phone"] = phone
+        has_consent = await user_service.has_consent(message.from_user.id)
+        if has_consent:
+            order = await order_service.complete_order(order_id)
+            notification_service = NotificationService(bot)
+            await notification_service.notify_new_order(order)
+            await conv_service.clear_state(message.from_user.id)
+            await message.answer(ResponseVariations.get_order_completed())
+        else:
+            await conv_service.update_state(message.from_user.id, OrderState.SHOW_PRIVACY_POLICY, context)
+            policy_text = UserService.get_privacy_policy_text()
+            keyboard = build_consent_keyboard()
+            await message.answer(policy_text, reply_markup=keyboard)
+
+def build_decor_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎨 Крем", callback_data="decor:cream")],[InlineKeyboardButton(text="🍫 Шоколад", callback_data="decor:chocolate")],[InlineKeyboardButton(text="🍓 Ягоды", callback_data="decor:berries")],[InlineKeyboardButton(text="🌸 Мастика", callback_data="decor:fondant")]])
+
+def build_addons_keyboard(context: dict):
+    topper = context.get("addon_topper", False)
+    sparkler = context.get("addon_sparkler", False)
+    photo = context.get("addon_photo_print", False)
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{'✅' if topper else '⬜'} Топпер (200₽)", callback_data="addon:topper")],[InlineKeyboardButton(text=f"{'✅' if sparkler else '⬜'} Свеча-фейерверк (150₽)", callback_data="addon:sparkler")],[InlineKeyboardButton(text=f"{'✅' if photo else '⬜'} Фотопечать (бесплатно)", callback_data="addon:photo_print")],[InlineKeyboardButton(text="✔️ Готово", callback_data="addons_done")]])
+
+def build_location_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📍 Тольятти 11", callback_data="location:Тольятти 11")],[InlineKeyboardButton(text="📍 Циолковского 36", callback_data="location:Циолковского 36")]])
+
+def build_consent_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Согласен", callback_data="consent:yes"),InlineKeyboardButton(text="❌ Не согласен", callback_data="consent:no")]])
+
+def validate_phone(phone: str):
+    phone = re.sub(r'[\s\-\(\)]', '', phone)
+    pattern = r'^(\+7|8|7)?[0-9]{10}$'
+    return bool(re.match(pattern, phone))
