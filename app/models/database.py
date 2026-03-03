@@ -102,3 +102,27 @@ class ConversationState(Base):
     
     # Timestamp
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class Settings(Base):
+    """Settings - key-value configuration storage"""
+    __tablename__ = "settings"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    value: Mapped[str] = mapped_column(Text)
+    
+    # Timestamp
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class Admin(Base):
+    """Admin - users who can manage bot and view statistics"""
+    __tablename__ = "admins"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    added_by: Mapped[int] = mapped_column(Integer)  # Telegram ID of who added them
+    
+    # Timestamp
+    added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

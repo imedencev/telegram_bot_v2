@@ -12,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_
 from app.models.database import Order, User, ConversationState
 from app.services.calendar_export import generate_ics_content, get_ics_filename
+from app.services.settings_service import SettingsService
+from app.services.admin_service import AdminService
 
 router = Router()
 
@@ -20,8 +22,9 @@ OWNER_ID = 747102879  # Owner's Telegram ID
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message, session: AsyncSession):
-    """Show order statistics (owner only)"""
-    if message.from_user.id != OWNER_ID:
+    """Show order statistics (owner and admins)"""
+    admin_service = AdminService(session)
+    if not await admin_service.is_admin_or_owner(message.from_user.id):
         return
     
     now = datetime.now()
@@ -218,7 +221,7 @@ async def cmd_support(message: Message):
 
 @router.message(Command("my_orders"))
 async def cmd_my_orders(message: Message, session: AsyncSession):
-    """Show user's order history"""
+    """Show user order history"""
     result = await session.execute(
         select(Order)
         .where(and_(
@@ -259,9 +262,8 @@ async def cmd_my_orders(message: Message, session: AsyncSession):
         
         orders_text += "\n"
     
-    # Add calendar export buttons for orders
     keyboard_buttons = []
-    for order in orders[:5]:  # Show buttons for first 5 orders
+    for order in orders[:5]:
         keyboard_buttons.append([InlineKeyboardButton(
             text=f"📅 Календарь для заказа #{order.id}",
             callback_data=f"export_calendar:{order.id}"
@@ -282,7 +284,6 @@ async def callback_export_calendar(callback: CallbackQuery, session: AsyncSessio
     try:
         order_id = int(callback.data.split(":")[1])
         
-        # Get order from database
         result = await session.execute(
             select(Order).where(and_(
                 Order.id == order_id,
@@ -295,12 +296,10 @@ async def callback_export_calendar(callback: CallbackQuery, session: AsyncSessio
             await callback.message.answer("❌ Заказ не найден")
             return
         
-        # Generate ICS file
         ics_content = generate_ics_content(order)
         ics_bytes = ics_content.encode('utf-8')
         ics_file = BufferedInputFile(ics_bytes, filename=get_ics_filename(order))
         
-        # Send ICS file
         await callback.message.answer_document(
             ics_file,
             caption=f"📅 Календарь для заказа #{order.id}\n\nОткройте файл, чтобы добавить событие в ваш календарь."
@@ -308,3 +307,95 @@ async def callback_export_calendar(callback: CallbackQuery, session: AsyncSessio
         
     except Exception as e:
         await callback.message.answer(f"❌ Ошибка экспорта: {str(e)}")
+
+
+@router.message(Command("set_notification_group"))
+async def cmd_set_notification_group(message: Message, session: AsyncSession):
+    """Set notification group for order alerts (owner only)"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    settings_service = SettingsService(session)
+    
+    if message.chat.type in ["group", "supergroup"]:
+        group_id = str(message.chat.id)
+        await settings_service.set_setting("notification_group_id", group_id)
+        await message.answer(f"✅ Группа уведомлений установлена\n\nID группы: {group_id}\n\nВсе новые заказы будут отправляться сюда.")
+    else:
+        await message.answer("❌ Эту команду нужно использовать в группе, куда должны приходить уведомления.\n\nДобавьте бота в группу и используйте команду там.")
+
+
+@router.message(Command("add_admin"))
+async def cmd_add_admin(message: Message, session: AsyncSession):
+    """Add admin (owner only, reply to user message)"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    if not message.reply_to_message:
+        await message.answer("❌ Ответьте на сообщение пользователя, которого хотите сделать админом")
+        return
+    
+    admin_service = AdminService(session)
+    target_id = message.reply_to_message.from_user.id
+    
+    if admin_service.is_owner(target_id):
+        await message.answer("❌ Владелец уже имеет все права")
+        return
+    
+    try:
+        await admin_service.add_admin(target_id, message.from_user.id)
+        target_name = message.reply_to_message.from_user.full_name or "Пользователь"
+        await message.answer(f"✅ Админ добавлен\n\n{target_name} (ID: {target_id})\n\nТеперь может использовать команды бота.")
+    except ValueError as e:
+        await message.answer(f"❌ {str(e)}")
+
+
+@router.message(Command("remove_admin"))
+async def cmd_remove_admin(message: Message, session: AsyncSession):
+    """Remove admin (owner only)"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    admin_service = AdminService(session)
+    
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+    else:
+        args = message.text.split()
+        if len(args) < 2:
+            await message.answer("❌ Ответьте на сообщение админа или укажите его ID\n\nПример: /remove_admin 123456789")
+            return
+        try:
+            target_id = int(args[1])
+        except ValueError:
+            await message.answer("❌ Неверный формат ID")
+            return
+    
+    try:
+        await admin_service.remove_admin(target_id)
+        await message.answer(f"✅ Админ удален\n\nID: {target_id}")
+    except ValueError as e:
+        await message.answer(f"❌ {str(e)}")
+
+
+@router.message(Command("list_admins"))
+async def cmd_list_admins(message: Message, session: AsyncSession):
+    """List all admins (owner and admins can use)"""
+    admin_service = AdminService(session)
+    
+    if not await admin_service.is_admin_or_owner(message.from_user.id):
+        return
+    
+    admins = await admin_service.list_admins()
+    
+    if not admins:
+        await message.answer(f"📋 Список админов пуст\n\nВладелец: {OWNER_ID}")
+        return
+    
+    admins_text = f"📋 <b>Список админов</b>\n\n<b>Владелец:</b> {OWNER_ID}\n\n<b>Админы:</b>\n"
+    
+    for admin in admins:
+        added_date = admin.added_at.strftime("%d.%m.%Y %H:%M")
+        admins_text += f"\n• ID: {admin.telegram_id}\n  Добавлен: {added_date}\n  Кем: {admin.added_by}"
+    
+    await message.answer(admins_text)
