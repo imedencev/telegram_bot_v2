@@ -109,17 +109,17 @@ async def callback_catalog_item(callback: CallbackQuery, session: AsyncSession):
         await callback.message.answer(f"Вы выбрали: {item.title}")
     if order_type == "cake":
         if "1.5кг к празднику" in item.title:
-            await order_service.update_order(order_id, weight_kg=1.5)
+            await order_service.update_order(order_id, weight_kg=1.5, decor_type="berries")
             context["weight_kg"] = 1.5
-            await conv_service.update_state(callback.from_user.id, OrderState.ASK_DECOR_TYPE, context)
-            keyboard = build_decor_keyboard()
-            await callback.message.answer("Выберите оформление торта:", reply_markup=keyboard)
+            context["decor_type"] = "berries"
+            await conv_service.update_state(callback.from_user.id, OrderState.ASK_INSCRIPTION, context)
+            await callback.message.answer("Какую надпись сделать на торте?\n(Напишите текст или отправьте '-' если надпись не нужна)")
         elif "Бенто торт" in item.title:
-            await order_service.update_order(order_id, weight_kg=0.3)
+            await order_service.update_order(order_id, weight_kg=0.3, decor_type="berries")
             context["weight_kg"] = 0.3
-            await conv_service.update_state(callback.from_user.id, OrderState.ASK_DECOR_TYPE, context)
-            keyboard = build_decor_keyboard()
-            await callback.message.answer("Выберите оформление торта:", reply_markup=keyboard)
+            context["decor_type"] = "berries"
+            await conv_service.update_state(callback.from_user.id, OrderState.ASK_INSCRIPTION, context)
+            await callback.message.answer("Какую надпись сделать на торте?\n(Напишите текст или отправьте '-' если надпись не нужна)")
         else:
             await conv_service.update_state(callback.from_user.id, OrderState.ASK_WEIGHT, context)
             await callback.message.answer("Какой вес торта? (минимум 2 кг, например: 2 или 2.5)")
@@ -336,11 +336,11 @@ async def handle_text_message(message: Message, session: AsyncSession, bot):
             if weight < 2 or weight > 20:
                 await message.answer("Пожалуйста, укажите вес от 2 до 20 кг")
                 return
-            await order_service.update_order(order_id, weight_kg=weight)
+            await order_service.update_order(order_id, weight_kg=weight, decor_type="berries")
             context["weight_kg"] = weight
-            await conv_service.update_state(message.from_user.id, OrderState.ASK_DECOR_TYPE, context)
-            keyboard = build_decor_keyboard()
-            await message.answer("Выберите оформление торта:", reply_markup=keyboard)
+            context["decor_type"] = "berries"
+            await conv_service.update_state(message.from_user.id, OrderState.ASK_INSCRIPTION, context)
+            await message.answer("Какую надпись сделать на торте?\n(Напишите текст или отправьте '-' если надпись не нужна)")
         except ValueError:
             await message.answer("Пожалуйста, введите число (например: 1.5 или 2)")
     elif current_state == OrderState.ASK_QUANTITY:
