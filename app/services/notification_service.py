@@ -4,7 +4,8 @@ Notification Service - notifies staff about new orders.
 import os
 from aiogram import Bot
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models.database import Order
+from sqlalchemy import select
+from app.models.database import Order, User
 from app.services.calendar_export import generate_ics_content, get_ics_filename
 from app.services.settings_service import SettingsService
 from aiogram.types import BufferedInputFile
@@ -20,7 +21,14 @@ class NotificationService:
         settings_service = SettingsService(session)
         notification_group_id = await settings_service.get_setting("notification_group_id")
         
-        message = self._format_order_message(order)
+        # Get customer name
+        result = await session.execute(
+            select(User).where(User.telegram_id == order.customer_telegram_id)
+        )
+        user = result.scalar_one_or_none()
+        customer_name = user.full_name if user and user.full_name else None
+        
+        message = self._format_order_message(order, customer_name)
         
         # Generate calendar file
         ics_content = generate_ics_content(order)
@@ -43,9 +51,13 @@ class NotificationService:
                 except Exception as e:
                     print(f"Failed to notify staff {staff_id}: {e}")
     
-    def _format_order_message(self, order: Order) -> str:
+    def _format_order_message(self, order: Order, customer_name: str = None) -> str:
         """Format order details for notification"""
         msg = f"🆕 <b>Новый заказ #{order.id}</b>\n\n"
+        
+        # Add customer name if available
+        if customer_name:
+            msg += f"👤 Заказчик: {customer_name}\n"
         
         if order.order_type == "cake":
             msg += f"🎂 Торт: {order.cake_flavor}\n"
