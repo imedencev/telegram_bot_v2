@@ -320,7 +320,16 @@ async def cmd_set_notification_group(message: Message, session: AsyncSession):
     if message.chat.type in ["group", "supergroup"]:
         group_id = str(message.chat.id)
         await settings_service.set_setting("notification_group_id", group_id)
-        await message.answer(f"✅ Группа уведомлений установлена\n\nID группы: {group_id}\n\nВсе новые заказы будут отправляться сюда.")
+        
+        # Get topic ID if message is in a topic
+        topic_id = message.message_thread_id
+        if topic_id:
+            await settings_service.set_setting("notification_topic_id", str(topic_id))
+            await message.answer(f"✅ Группа уведомлений установлена\n\nID группы: {group_id}\nID темы: {topic_id}\n\nВсе новые заказы будут отправляться в эту тему.")
+        else:
+            # Clear topic_id if set in general chat
+            await settings_service.set_setting("notification_topic_id", "")
+            await message.answer(f"✅ Группа уведомлений установлена\n\nID группы: {group_id}\n\nВсе новые заказы будут отправляться в общий чат группы.")
     else:
         await message.answer("❌ Эту команду нужно использовать в группе, куда должны приходить уведомления.\n\nДобавьте бота в группу и используйте команду там.")
 

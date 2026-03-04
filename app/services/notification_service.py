@@ -20,6 +20,10 @@ class NotificationService:
         """Send notification to staff about new order"""
         settings_service = SettingsService(session)
         notification_group_id = await settings_service.get_setting("notification_group_id")
+        notification_topic_id = await settings_service.get_setting("notification_topic_id")
+        
+        # Parse topic ID if available
+        topic_id = int(notification_topic_id) if notification_topic_id and notification_topic_id.strip() else None
         
         # Get customer name
         result = await session.execute(
@@ -36,10 +40,10 @@ class NotificationService:
         ics_file = BufferedInputFile(ics_bytes, filename=get_ics_filename(order))
         
         if notification_group_id:
-            # Send to configured group
+            # Send to configured group (with topic if specified)
             try:
-                await self.bot.send_message(int(notification_group_id), message, parse_mode="HTML")
-                await self.bot.send_document(int(notification_group_id), ics_file)
+                await self.bot.send_message(int(notification_group_id), message, message_thread_id=topic_id, parse_mode="HTML")
+                await self.bot.send_document(int(notification_group_id), ics_file, message_thread_id=topic_id)
             except Exception as e:
                 print(f"Failed to notify group {notification_group_id}: {e}")
         else:
