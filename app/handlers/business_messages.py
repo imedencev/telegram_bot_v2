@@ -399,3 +399,163 @@ async def cmd_list_admins(message: Message, session: AsyncSession):
         admins_text += f"\n• ID: {admin.telegram_id}\n  Добавлен: {added_date}\n  Кем: {admin.added_by}"
     
     await message.answer(admins_text)
+
+
+@router.message(Command("orders_tomorrow"))
+async def cmd_orders_tomorrow(message: Message, session: AsyncSession):
+    """Show orders for tomorrow (owner and admins)"""
+    admin_service = AdminService(session)
+    if not await admin_service.is_admin_or_owner(message.from_user.id):
+        return
+    
+    from datetime import datetime, timedelta
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
+    
+    # Get all confirmed orders
+    result = await session.execute(
+        select(Order)
+        .where(Order.status.in_(["confirmed", "completed"]))
+        .order_by(Order.issue_time)
+    )
+    orders = list(result.scalars().all())
+    
+    # Filter orders for tomorrow (issue_time contains tomorrow's date)
+    tomorrow_orders = [o for o in orders if o.issue_time and tomorrow in o.issue_time]
+    
+    if not tomorrow_orders:
+        await message.answer(f"📋 Заказов на завтра ({tomorrow}) нет")
+        return
+    
+    orders_text = f"📋 <b>Заказы на завтра ({tomorrow})</b>\n\n"
+    
+    for order in tomorrow_orders:
+        orders_text += f"🎂 <b>Заказ #{order.id}</b>\n"
+        orders_text += f"🕐 {order.issue_time}\n"
+        
+        if order.customer_phone:
+            orders_text += f"📞 {order.customer_phone}\n"
+        
+        # Show calendar notes if imported from calendar
+        if order.calendar_notes:
+            orders_text += f"📝 {order.calendar_notes}\n"
+        else:
+            # Show regular order details
+            if order.cake_flavor:
+                orders_text += f"🎂 {order.cake_flavor}\n"
+            if order.weight_kg:
+                orders_text += f"⚖️ {order.weight_kg} кг\n"
+            if order.quantity:
+                orders_text += f"🔢 {order.quantity} шт\n"
+            if order.inscription:
+                orders_text += f"✍️ Надпись: {order.inscription}\n"
+            if order.pickup_location:
+                orders_text += f"📍 {order.pickup_location}\n"
+        
+        orders_text += "\n"
+    
+    await message.answer(orders_text)
+
+
+@router.message(Command("import_calendar"))
+async def cmd_import_calendar(message: Message, session: AsyncSession):
+    """Import orders from iPhone calendar .ics file (owner only)"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    await message.answer(
+        "📅 <b>Импорт из календаря</b>\n\n"
+        "Отправьте .ics файл с вашего iPhone календаря.\n\n"
+        "Бот создаст заказы из событий календаря:\n"
+        "• Дата/время - из времени начала события\n"
+        "• Телефон - найдёт в тексте события\n"
+        "• Описание - сохранит весь текст события\n\n"
+        "Отправьте файл ответом на это сообщение."
+    )
+
+
+@router.message(F.document)
+async def handle_calendar_file(message: Message, session: AsyncSession):
+    """Handle .ics file upload for calendar import"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    # Check if it's an .ics file
+    if not message.document.file_name.endswith('.ics'):
+        return
+    
+    try:
+        from icalendar import Calendar
+        import re
+        from datetime import datetime
+        
+        # Download file
+        file = await message.bot.download(message.document.file_id)
+        ics_content = file.read().decode('utf-8')
+        
+        # Parse calendar
+        cal = Calendar.from_ical(ics_content)
+        
+        imported_count = 0
+        failed_count = 0
+        
+        for component in cal.walk():
+            if component.name == "VEVENT":
+                try:
+                    # Extract event data
+                    summary = str(component.get('summary', ''))
+                    description = str(component.get('description', ''))
+                    dtstart = component.get('dtstart')
+                    
+                    if not dtstart:
+                        failed_count += 1
+                        continue
+                    
+                    # Get event start time
+                    if hasattr(dtstart.dt, 'strftime'):
+                        event_time = dtstart.dt.strftime("%d.%m.%Y %H:%M")
+                    else:
+                        event_time = str(dtstart.dt)
+                    
+                    # Combine summary and description
+                    full_text = summary
+                    if description and description != summary:
+                        full_text += f"\n{description}"
+                    
+                    # Extract phone number using regex
+                    phone_pattern = r'(\+?[78][\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})'
+                    phone_match = re.search(phone_pattern, full_text)
+                    phone = phone_match.group(1) if phone_match else None
+                    
+                    # Create order
+                    order = Order(
+                        customer_telegram_id=message.from_user.id,
+                        order_type="imported",
+                        issue_time=event_time,
+                        customer_phone=phone,
+                        calendar_notes=full_text,
+                        status="confirmed"
+                    )
+                    session.add(order)
+                    imported_count += 1
+                    
+                except Exception as e:
+                    failed_count += 1
+                    print(f"Failed to import event: {e}")
+        
+        await session.flush()
+        
+        result_text = f"✅ <b>Импорт завершён</b>\n\n"
+        result_text += f"Импортировано: {imported_count} заказов\n"
+        if failed_count > 0:
+            result_text += f"Не удалось импортировать: {failed_count}\n"
+        result_text += f"\nИспользуйте /orders_tomorrow для просмотра"
+        
+        await message.answer(result_text)
+        
+    except ImportError:
+        await message.answer(
+            "❌ Библиотека icalendar не установлена.\n\n"
+            "Необходимо добавить в requirements.txt и пересобрать контейнер."
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка импорта: {str(e)}")

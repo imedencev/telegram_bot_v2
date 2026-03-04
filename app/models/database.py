@@ -57,6 +57,9 @@ class Order(Base):
     # Contact
     customer_phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     
+    # Calendar import (for orders imported from external calendar)
+    calendar_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
     # Notifications
     notify_ready_early: Mapped[bool] = mapped_column(Boolean, default=False)  # Notify when ready early
     
